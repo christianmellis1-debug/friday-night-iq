@@ -1,0 +1,19 @@
+Inside Zone Right
+Personnel: 11
+Formation: Doubles Right
+OL: Reach play-side gap; if uncovered, work combination to linebacker.
+RB: Aim frontside A gap, read first down lineman outside center.
+QB: Mesh point, carry fake after handoff.
+---
+Counter GT
+Personnel: 11
+Formation: Trey Left
+OL: Backside guard pulls to kick; backside tackle wraps through.
+RB: Counter step, follow wrap blocker.
+QB: Mesh and boot opposite action.
+---
+Quick Slant / Flat
+Personnel: 10
+Formation: Trips Right
+QB: Read flat defender to slant window.
+WR: No. 1 releases slant. No. 2 runs immediate flat.
