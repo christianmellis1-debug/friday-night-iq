@@ -22,7 +22,7 @@ store.init_db()
 
 POSITIONS=["QB","RB","WR","TE","OL","DL","LB","DB","ST","ALL"]
 UNITS=["Offense","Defense","Special Teams"]
-NAV=["Dashboard","Playbook Library","Upload Center","Weekly Installs","Roster","Player Preview","Data & Settings"]
+NAV=["Dashboard","Playbook Library","Upload Center","Weekly Installs","Quiz Builder","Roster","Player Preview","Team Readiness","Data & Settings"]
 
 st.markdown("""
 <style>
@@ -308,6 +308,40 @@ elif section=="Weekly Installs":
                     store.write("DELETE FROM installs WHERE id=? AND team_id=?",(ins['id'],team_id))
                     st.rerun()
 
+elif section=="Quiz Builder":
+    headline("Quiz Builder", "Coaches write short checks for understanding for each play.")
+    st.info("Questions are written and verified by the coach; answers are never automatically guessed from uploaded playbooks.")
+    if not plays:
+        st.info("Create a play in the library before adding quiz questions.")
+    else:
+        play_ids=[p['id'] for p in plays]
+        chosen_id=st.selectbox("Choose a play",play_ids,
+            format_func=lambda i:next(p['title']+' · '+p['unit'] for p in plays if p['id']==i),key="quiz_builder_play")
+        questions=store.quiz_questions(team_id,chosen_id)
+        st.caption(f"{len(questions)} question(s) for this play")
+        with st.expander("＋ Add a question",expanded=not bool(questions)):
+            with st.form(f"new_question_{team_id}_{chosen_id}",clear_on_submit=True):
+                prompt=st.text_area("Question",placeholder="What is the first responsibility on this play?",max_chars=500)
+                c1,c2=st.columns(2)
+                answers=[c1.text_input("Answer A",max_chars=250),c2.text_input("Answer B",max_chars=250),
+                         c1.text_input("Answer C",max_chars=250),c2.text_input("Answer D",max_chars=250)]
+                correct=st.selectbox("Correct answer",["A","B","C","D"])
+                if st.form_submit_button("Save question",type="primary"):
+                    try:
+                        store.add_quiz_question(team_id,chosen_id,prompt,answers,correct)
+                        st.success("Question added.")
+                        st.rerun()
+                    except ValueError as exc:
+                        st.error(str(exc))
+        for index,q in enumerate(questions,1):
+            with st.expander(f"Question {index} · {q['question_text']}"):
+                for letter in ('A','B','C','D'):
+                    st.write(f"{'✓ ' if letter==q['correct_option'] else ''}{letter}. {q['option_'+letter.lower()]}")
+                if st.button("Delete question",key=f"delete_question_{team_id}_{q['id']}"):
+                    store.delete_quiz_question(team_id,q['id'])
+                    st.rerun()
+        st.caption("Questions are available in Player Preview after this play is assigned to a weekly install.")
+
 elif section=="Roster":
     headline("Roster","Define which players receive QB, OL, defensive, and special-teams assignments.")
     with st.expander("＋ Add a player",expanded=not bool(players)):
@@ -389,6 +423,53 @@ elif section=="Player Preview":
                     if st.button("Save status",key=f"save_{player_id}_{install_id}_{p['id']}"):
                         store.set_progress(team_id,player_id,install_id,p['id'],choice)
                         st.rerun()
+                questions=store.quiz_questions(team_id,p['id'])
+                if questions:
+                    previous=store.last_quiz_attempt(team_id,player_id,install_id,p['id'])
+                    if previous:
+                        st.caption(f"Last quiz: {previous['correct_count']}/{previous['question_count']} correct ({100*previous['correct_count']//previous['question_count']}%)")
+                    st.markdown("**Knowledge check**")
+                    st.caption("Coach-written questions · demo only · results do not automatically change your study status.")
+                    with st.form(f"quiz_form_{team_id}_{player_id}_{install_id}_{p['id']}"):
+                        given={}
+                        for num,q in enumerate(questions,1):
+                            chosen=st.radio(f"{num}. {q['question_text']}",['A','B','C','D'],index=None,
+                                format_func=lambda v,q=q:f"{v}. {q['option_'+v.lower()]}",
+                                key=f"answer_{team_id}_{player_id}_{install_id}_{p['id']}_{q['id']}")
+                            if chosen is not None:
+                                given[q['id']]=chosen
+                        submitted=st.form_submit_button("Submit knowledge check",type="primary")
+                        if submitted:
+                            try:
+                                result=store.submit_quiz(team_id,player_id,install_id,p['id'],given)
+                                st.success(f"Score: {result['correct']}/{result['total']} correct ({result['percent']}%).")
+                            except ValueError as exc:
+                                st.error(str(exc))
+
+elif section=="Team Readiness":
+    headline("Team Readiness", "See who has studied each week's plays and how their quiz attempts went.")
+    st.warning("Demo reporting only: players have no secure accounts, and local results may be lost on a Streamlit restart.",icon="🔒")
+    if not installs:
+        st.info("Create a weekly install to see readiness results.")
+    else:
+        install_id=st.selectbox("Weekly install",[i['id'] for i in installs],
+            format_func=lambda k:next(i['title'] for i in installs if i['id']==k),key="readiness_install")
+        report=store.team_readiness(team_id,install_id)
+        if report:
+            count=sum(r['assigned'] for r in report)
+            ready=sum(r['ready'] for r in report)
+            scored=[r['average_quiz_score'] for r in report if r['average_quiz_score'] is not None]
+            a,b,c=st.columns(3)
+            a.metric("Assigned play studies",count)
+            b.metric("Marked ready",f"{ready}/{count}" if count else "—")
+            c.metric("Avg. player quiz score",f"{round(sum(scored)/len(scored))}%" if scored else "—")
+            st.dataframe([{"Player":r['player'],"Position":r['position'],
+                "Ready / Assigned":f"{r['ready']}/{r['assigned']}",
+                "Quizzes attempted":r['quizzes_taken'],
+                "Avg. latest score":f"{r['average_quiz_score']}%" if r['average_quiz_score'] is not None else "—"}
+                for r in report],hide_index=True,use_container_width=True)
+            st.caption("Readiness is self-marked; quiz scores are the player's most recent attempt per play. These are different measures.")
+        else: st.info("There are no rostered players for this team.")
 
 elif section=="Data & Settings":
     headline("Data & Settings","Prototype safeguards and backups.")
@@ -398,7 +479,7 @@ elif section=="Data & Settings":
     st.write(f"**Code:** {team['code']}")
     st.caption("A workspace code is not an authentication mechanism. Do not treat it like a protected player or coach account.")
     st.markdown("### Back up this workspace")
-    st.write("Export includes roster information, plays, study statuses, weekly installs, and original uploaded files.")
+    st.write("Export includes roster information, plays, study statuses, coach-written quizzes, quiz attempts, weekly installs, and original uploaded files.")
     st.download_button("Download complete JSON backup",data=store.export_team(team_id),
       file_name=f"friday-night-iq-team-{team_id}-backup.json",mime="application/json",type="primary")
     st.caption("Backups contain uploaded coaching files and player names. Store them securely. Restore/import is not implemented in this prototype.")
