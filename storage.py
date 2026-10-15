@@ -105,6 +105,31 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_plays_team ON plays(team_id);
         CREATE INDEX IF NOT EXISTS idx_players_team ON players(team_id);
         CREATE INDEX IF NOT EXISTS idx_installs_team ON installs(team_id);
+        CREATE TABLE IF NOT EXISTS quiz_questions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            team_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+            play_id INTEGER NOT NULL REFERENCES plays(id) ON DELETE CASCADE,
+            question_text TEXT NOT NULL,
+            option_a TEXT NOT NULL,
+            option_b TEXT NOT NULL,
+            option_c TEXT NOT NULL,
+            option_d TEXT NOT NULL,
+            correct_option TEXT NOT NULL CHECK(correct_option IN ('A','B','C','D')),
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS quiz_attempts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            team_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+            player_id INTEGER NOT NULL REFERENCES players(id) ON DELETE CASCADE,
+            install_id INTEGER NOT NULL REFERENCES installs(id) ON DELETE CASCADE,
+            play_id INTEGER NOT NULL REFERENCES plays(id) ON DELETE CASCADE,
+            correct_count INTEGER NOT NULL,
+            question_count INTEGER NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_quiz_questions_team_play ON quiz_questions(team_id,play_id);
+        CREATE INDEX IF NOT EXISTS idx_quiz_attempts_team_player_install
+            ON quiz_attempts(team_id,player_id,install_id,play_id,id);
         """)
         if db.execute("SELECT COUNT(*) FROM teams").fetchone()[0] == 0:
             code = "DEMO" + secrets.token_hex(2).upper()
@@ -202,6 +227,86 @@ def set_progress(team_id:int,player_id:int,install_id:int,play_id:int,status:str
         updated_at=CURRENT_TIMESTAMP""",(player_id,install_id,play_id,status))
 
 
+def quiz_questions(team_id: int, play_id: int) -> list[dict]:
+    """Return only a team's own questions for a play."""
+    return rows("""SELECT q.* FROM quiz_questions q JOIN plays p ON p.id=q.play_id
+        WHERE q.team_id=? AND q.play_id=? AND p.team_id=? ORDER BY q.id""",
+        (team_id, play_id, team_id))
+
+
+def add_quiz_question(team_id: int, play_id: int, prompt: str,
+                      options: list[str], correct_option: str) -> int:
+    """Questions and answers are coach-authored, never invented from playbook text."""
+    if not isinstance(prompt,str) or not prompt.strip() or len(prompt)>500:
+        raise ValueError("Enter a question (500 characters maximum)")
+    if len(options)!=4 or not all(isinstance(x,str) and 0<len(x.strip())<=250 for x in options):
+        raise ValueError("Enter four answer choices (250 characters maximum each)")
+    cleaned=[x.strip() for x in options]
+    if len({x.casefold() for x in cleaned})!=4:
+        raise ValueError("Answer choices must be different")
+    if correct_option not in ('A','B','C','D'):
+        raise ValueError("Choose the correct answer")
+    with connect() as db:
+        if not db.execute("SELECT 1 FROM plays WHERE id=? AND team_id=?",(play_id,team_id)).fetchone():
+            raise ValueError("Play does not belong to this team")
+        return db.execute("""INSERT INTO quiz_questions
+            (team_id,play_id,question_text,option_a,option_b,option_c,option_d,correct_option)
+            VALUES(?,?,?,?,?,?,?,?)""",
+            (team_id,play_id,prompt.strip(),*cleaned,correct_option)).lastrowid
+
+
+def delete_quiz_question(team_id: int, question_id: int):
+    with connect() as db:
+        db.execute("DELETE FROM quiz_questions WHERE team_id=? AND id=?",(team_id,question_id))
+
+
+def last_quiz_attempt(team_id: int, player_id: int, install_id: int, play_id: int) -> dict | None:
+    return one("""SELECT a.* FROM quiz_attempts a
+        JOIN players p ON p.id=a.player_id AND p.team_id=a.team_id
+        JOIN installs i ON i.id=a.install_id AND i.team_id=a.team_id
+        JOIN plays pl ON pl.id=a.play_id AND pl.team_id=a.team_id
+        WHERE a.team_id=? AND a.player_id=? AND a.install_id=? AND a.play_id=?
+        ORDER BY a.id DESC LIMIT 1""", (team_id,player_id,install_id,play_id))
+
+
+def submit_quiz(team_id: int, player_id: int, install_id: int,
+                play_id: int, answers: dict[int, str]) -> dict:
+    """Grade server-side against coach-defined answers, after checking team and position."""
+    if play_id not in {p['id'] for p in player_install_plays(team_id,player_id,install_id)}:
+        raise ValueError("This play is not assigned to this player")
+    with connect() as db:
+        questions=[dict(q) for q in db.execute("""SELECT q.* FROM quiz_questions q
+            JOIN plays p ON p.id=q.play_id AND p.team_id=q.team_id
+            WHERE q.team_id=? AND q.play_id=? ORDER BY q.id""", (team_id,play_id)).fetchall()]
+        if not questions:
+            raise ValueError("There is no quiz for this play")
+        q_ids={q['id'] for q in questions}
+        if set(answers)!=q_ids or any(answers[q] not in ('A','B','C','D') for q in q_ids):
+            raise ValueError("Answer every question before submitting")
+        correct=sum(answers[q['id']]==q['correct_option'] for q in questions)
+        count=len(questions)
+        db.execute("""INSERT INTO quiz_attempts
+            (team_id,player_id,install_id,play_id,correct_count,question_count)
+            VALUES(?,?,?,?,?,?)""", (team_id,player_id,install_id,play_id,correct,count))
+    return {"correct":correct,"total":count,"percent":round(100*correct/count)}
+
+
+def team_readiness(team_id: int, install_id: int) -> list[dict]:
+    if not one("SELECT 1 FROM installs WHERE id=? AND team_id=?",(install_id,team_id)):
+        return []
+    output=[]
+    for player in rows("SELECT * FROM players WHERE team_id=? ORDER BY position,name",(team_id,)):
+        assigned=player_install_plays(team_id,player['id'],install_id)
+        attempts=[last_quiz_attempt(team_id,player['id'],install_id,p['id']) for p in assigned]
+        attempts=[a for a in attempts if a]
+        output.append({"player":player['name'],"position":player['position'],
+                       "assigned":len(assigned),"ready":sum(p['study_status']=='Ready' for p in assigned),
+                       "quizzes_taken":len(attempts),
+                       "average_quiz_score":round(sum(100*a['correct_count']/a['question_count']
+                           for a in attempts)/len(attempts)) if attempts else None})
+    return output
+
+
 def export_team(team_id: int) -> bytes:
     """Portable backup including original upload bytes; should be stored securely."""
     import base64
@@ -219,5 +324,7 @@ def export_team(team_id: int) -> bytes:
         "installs":rows("SELECT * FROM installs WHERE team_id=?",(team_id,)),
         "install_plays":rows("""SELECT ip.* FROM install_plays ip JOIN installs i ON i.id=ip.install_id WHERE i.team_id=?""",(team_id,)),
         "progress":rows("""SELECT pr.* FROM progress pr JOIN players p ON p.id=pr.player_id WHERE p.team_id=?""",(team_id,)),
+        "quiz_questions":rows("SELECT * FROM quiz_questions WHERE team_id=?",(team_id,)),
+        "quiz_attempts":rows("SELECT * FROM quiz_attempts WHERE team_id=?",(team_id,)),
     }
     return json.dumps(payload,ensure_ascii=False,indent=2).encode('utf-8')
